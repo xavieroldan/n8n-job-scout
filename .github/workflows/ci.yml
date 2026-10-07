@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Unit and workflow tests
+        run: npm test
+
+      - name: Workflow JSON is generated from src
+        run: npm run check
+
+      - name: Workflow JSON is valid
+        run: node -e "JSON.parse(require('fs').readFileSync('workflows/job-scout.json','utf8'))"

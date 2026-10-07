@@ -1,0 +1,16 @@
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n-job-scout
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    env_file: .env
+    environment:
+      # Allow Code nodes to read config files and env vars used by the workflow
+      - NODE_FUNCTION_ALLOW_BUILTIN=fs,crypto
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./config:/data/config:ro
+      - ./prompts:/data/prompts:ro

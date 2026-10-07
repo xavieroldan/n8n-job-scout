@@ -1,0 +1,256 @@
+{
+  "name": "n8n Job Scout",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Every day 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\n// Parse the feeds file: one URL per line, ignoring blanks and comments.\nfunction parseFeedList(text) {\n  return String(text || '')\n    .split(/\\r?\\n/)\n    .map((line) => line.trim())\n    .filter((line) => line && !line.startsWith('#'))\n    .filter((line) => /^https?:\\/\\//i.test(line));\n}\n\nconst text = fs.readFileSync('/data/config/feeds.txt', 'utf8');\nconst urls = parseFeedList(text);\nif (!urls.length) throw new Error('No feeds configured in config/feeds.txt');\nreturn urls.map((url) => ({ json: { url } }));"
+      },
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "name": "Load feeds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Read RSS feeds",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\n// Turn raw RSS items into a common offer shape and drop already-seen offers.\n\nconst MAX_DESCRIPTION_CHARS = 3000;\nconst SEEN_TTL_DAYS = 30;\n\nfunction stripHtml(html) {\n  return String(html || '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n// Canonical id: link without query string, hash or trailing slash.\nfunction offerId(link, title, company) {\n  if (link) {\n    return String(link).toLowerCase().split('#')[0].split('?')[0].replace(/\\/+$/, '');\n  }\n  return `${String(company || '').toLowerCase()}|${String(title || '').toLowerCase()}`.trim();\n}\n\n// Many boards publish titles as \"Company: Role\".\nfunction splitTitle(rawTitle) {\n  const title = String(rawTitle || '').trim();\n  const match = title.match(/^([^:]{2,60}):\\s+(.+)$/);\n  return match ? { company: match[1].trim(), title: match[2].trim() } : { company: '', title };\n}\n\nfunction normalizeOffer(raw, source) {\n  const parts = splitTitle(raw.title);\n  const company = String(raw.company || raw.creator || parts.company || '').trim();\n  const title = parts.title;\n  const link = String(raw.link || raw.guid || '').trim();\n  const description = stripHtml(raw.content || raw['content:encoded'] || raw.contentSnippet || raw.description)\n    .slice(0, MAX_DESCRIPTION_CHARS);\n  const location = String(raw.location || raw.region || '').trim();\n  return {\n    id: offerId(link, title, company),\n    title,\n    company,\n    location,\n    link,\n    description,\n    source: source || '',\n    publishedAt: raw.isoDate || raw.pubDate || '',\n  };\n}\n\n// Returns fresh offers and the updated seen map ({ id: epochMs }), pruning old entries.\nfunction dedupeOffers(offers, seen, nowMs, maxOffers) {\n  const ttlMs = SEEN_TTL_DAYS * 24 * 60 * 60 * 1000;\n  const nextSeen = {};\n  for (const [id, ts] of Object.entries(seen || {})) {\n    if (nowMs - ts < ttlMs) nextSeen[id] = ts;\n  }\n  const fresh = [];\n  for (const offer of offers) {\n    if (!offer.id || !offer.title || nextSeen[offer.id]) continue;\n    if (fresh.length >= maxOffers) break;\n    nextSeen[offer.id] = nowMs;\n    fresh.push(offer);\n  }\n  return { fresh, seen: nextSeen };\n}\n\n// Build the Claude request for an offer and parse its structured answer.\n\nconst MAX_TOKENS = 400;\n\nfunction fillTemplate(template, profile, offer) {\n  const values = {\n    PROFILE: profile,\n    TITLE: offer.title,\n    COMPANY: offer.company || 'Unknown',\n    LOCATION: offer.location || 'Unknown',\n    LINK: offer.link,\n    DESCRIPTION: offer.description || 'No description',\n  };\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (all, key) =>\n    Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : all);\n}\n\nfunction buildRequestBody(prompt, model) {\n  return {\n    model,\n    max_tokens: MAX_TOKENS,\n    temperature: 0,\n    messages: [{ role: 'user', content: prompt }],\n  };\n}\n\nfunction clampScore(value) {\n  const n = Math.round(Number(value));\n  if (!Number.isFinite(n)) return 0;\n  return Math.max(0, Math.min(100, n));\n}\n\n// Accepts the raw Anthropic Messages API response; never throws.\nfunction parseScoreResponse(response) {\n  const fallback = (reason) => ({\n    score: 0, match_reasons: [], red_flags: [reason], seniority_fit: 'unknown', remote_ok: false, error: true,\n  });\n  if (!response || response.error) {\n    return fallback(`API error: ${response && response.error ? JSON.stringify(response.error).slice(0, 200) : 'empty response'}`);\n  }\n  const block = Array.isArray(response.content) ? response.content.find((c) => c.type === 'text') : null;\n  if (!block) return fallback('No text in model response');\n  const text = block.text.trim();\n  const jsonText = (text.match(/\\{[\\s\\S]*\\}/) || [''])[0];\n  let data;\n  try {\n    data = JSON.parse(jsonText);\n  } catch (e) {\n    return fallback('Model response was not valid JSON');\n  }\n  const list = (v) => (Array.isArray(v) ? v.map(String).slice(0, 3) : []);\n  return {\n    score: clampScore(data.score),\n    match_reasons: list(data.match_reasons),\n    red_flags: list(data.red_flags),\n    seniority_fit: ['under', 'fit', 'over'].includes(data.seniority_fit) ? data.seniority_fit : 'unknown',\n    remote_ok: data.remote_ok === true,\n    error: false,\n  };\n}\n\nfunction hostOf(link) {\n  const match = String(link || '').match(/^https?:\\/\\/([^/]+)/i);\n  return match ? match[1] : '';\n}\n\nconst model = $env.JOBSCOUT_MODEL || 'claude-haiku-4-5-20251001';\nconst maxOffers = parseInt($env.JOBSCOUT_MAX_OFFERS || '40', 10);\nconst profile = fs.readFileSync('/data/config/profile.md', 'utf8');\nconst template = fs.readFileSync('/data/prompts/score-offer.md', 'utf8').replace(/^<!--[\\s\\S]*?-->\\s*/, '');\n\nconst raw = $input.all().map((i) => i.json).filter((j) => j && !j.error && (j.title || j.link));\nconst offers = raw.map((r) => normalizeOffer(r, hostOf(r.link)));\n\nconst staticData = $getWorkflowStaticData('global');\nconst { fresh, seen } = dedupeOffers(offers, staticData.seen || {}, Date.now(), maxOffers);\nstaticData.seen = seen;\n\nreturn fresh.map((offer) => ({\n  json: { offer, requestBody: buildRequestBody(fillTemplate(template, profile, offer), model) },\n}));"
+      },
+      "id": "a1b2c3d4-0005-4000-8000-000000000005",
+      "name": "Normalize & dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        }
+      },
+      "id": "a1b2c3d4-0006-4000-8000-000000000006",
+      "name": "Score with Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the Claude request for an offer and parse its structured answer.\n\nconst MAX_TOKENS = 400;\n\nfunction fillTemplate(template, profile, offer) {\n  const values = {\n    PROFILE: profile,\n    TITLE: offer.title,\n    COMPANY: offer.company || 'Unknown',\n    LOCATION: offer.location || 'Unknown',\n    LINK: offer.link,\n    DESCRIPTION: offer.description || 'No description',\n  };\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (all, key) =>\n    Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : all);\n}\n\nfunction buildRequestBody(prompt, model) {\n  return {\n    model,\n    max_tokens: MAX_TOKENS,\n    temperature: 0,\n    messages: [{ role: 'user', content: prompt }],\n  };\n}\n\nfunction clampScore(value) {\n  const n = Math.round(Number(value));\n  if (!Number.isFinite(n)) return 0;\n  return Math.max(0, Math.min(100, n));\n}\n\n// Accepts the raw Anthropic Messages API response; never throws.\nfunction parseScoreResponse(response) {\n  const fallback = (reason) => ({\n    score: 0, match_reasons: [], red_flags: [reason], seniority_fit: 'unknown', remote_ok: false, error: true,\n  });\n  if (!response || response.error) {\n    return fallback(`API error: ${response && response.error ? JSON.stringify(response.error).slice(0, 200) : 'empty response'}`);\n  }\n  const block = Array.isArray(response.content) ? response.content.find((c) => c.type === 'text') : null;\n  if (!block) return fallback('No text in model response');\n  const text = block.text.trim();\n  const jsonText = (text.match(/\\{[\\s\\S]*\\}/) || [''])[0];\n  let data;\n  try {\n    data = JSON.parse(jsonText);\n  } catch (e) {\n    return fallback('Model response was not valid JSON');\n  }\n  const list = (v) => (Array.isArray(v) ? v.map(String).slice(0, 3) : []);\n  return {\n    score: clampScore(data.score),\n    match_reasons: list(data.match_reasons),\n    red_flags: list(data.red_flags),\n    seniority_fit: ['under', 'fit', 'over'].includes(data.seniority_fit) ? data.seniority_fit : 'unknown',\n    remote_ok: data.remote_ok === true,\n    error: false,\n  };\n}\n\nconst offers = $('Normalize & dedupe').all().map((i) => i.json.offer);\nconst staticData = $getWorkflowStaticData('global');\n\nreturn $input.all().map((item, idx) => {\n  const offer = offers[idx] || {};\n  const result = parseScoreResponse(item.json);\n  // Let failed offers be retried on the next run\n  if (result.error && staticData.seen && offer.id) delete staticData.seen[offer.id];\n  return { json: { ...offer, ...result } };\n});"
+      },
+      "id": "a1b2c3d4-0007-4000-8000-000000000007",
+      "name": "Parse scores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the plain-text Telegram digest from scored offers.\n\nconst TELEGRAM_LIMIT = 4000;\n\nfunction buildDigest(scored, minScore, dateLabel) {\n  const matches = scored\n    .filter((o) => !o.error && o.score >= minScore)\n    .sort((a, b) => b.score - a.score);\n  const failed = scored.filter((o) => o.error).length;\n\n  const header = `Job Scout · ${dateLabel}\\n${matches.length} match(es) >= ${minScore} out of ${scored.length} new offer(s)`;\n  const footer = failed ? `\\n\\n${failed} offer(s) could not be scored.` : '';\n  if (!matches.length) {\n    return { text: `${header}\\n\\nNo offers above the threshold today.${footer}`, count: 0 };\n  }\n\n  let body = '';\n  let shown = 0;\n  for (const o of matches) {\n    const company = o.company ? ` · ${o.company}` : '';\n    const reasons = o.match_reasons.length ? `\\n  + ${o.match_reasons.join('\\n  + ')}` : '';\n    const flags = o.red_flags.length ? `\\n  - ${o.red_flags.join('\\n  - ')}` : '';\n    const entry = `\\n\\n[${o.score}] ${o.title}${company}${o.remote_ok ? ' · remote' : ''}\\n${o.link}${reasons}${flags}`;\n    if ((header + body + entry + footer).length > TELEGRAM_LIMIT) break;\n    body += entry;\n    shown += 1;\n  }\n  const more = shown < matches.length ? `\\n\\n…and ${matches.length - shown} more.` : '';\n  return { text: header + body + more + footer, count: matches.length };\n}\n\nconst minScore = parseInt($env.JOBSCOUT_MIN_SCORE || '70', 10);\nconst date = new Date().toISOString().slice(0, 10);\nreturn [{ json: buildDigest($input.all().map((i) => i.json), minScore, date) }];"
+      },
+      "id": "a1b2c3d4-0008-4000-8000-000000000008",
+      "name": "Build digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "a1b2c3d4-0009-4000-8000-000000000009",
+      "name": "Send Telegram digest",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every day 08:00": {
+      "main": [
+        [
+          {
+            "node": "Load feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Load feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load feeds": {
+      "main": [
+        [
+          {
+            "node": "Read RSS feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read RSS feeds": {
+      "main": [
+        [
+          {
+            "node": "Normalize & dedupe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & dedupe": {
+      "main": [
+        [
+          {
+            "node": "Score with Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score with Claude": {
+      "main": [
+        [
+          {
+            "node": "Parse scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse scores": {
+      "main": [
+        [
+          {
+            "node": "Build digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build digest": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Madrid"
+  },
+  "pinData": {},
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

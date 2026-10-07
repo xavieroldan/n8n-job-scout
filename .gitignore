@@ -1,0 +1,16 @@
+# Secrets and personal data
+.env
+config/profile.md
+config/feeds.txt
+
+# n8n local data
+n8n_data/
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

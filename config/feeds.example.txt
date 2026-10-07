@@ -1,0 +1,5 @@
+# One RSS feed URL per line. Lines starting with # are ignored.
+# Copy to config/feeds.txt and add the job-board feeds you subscribe to.
+# Only use feeds the site provides publicly; do not scrape sites that forbid it.
+https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss
+https://remoteok.com/remote-jobs.rss
